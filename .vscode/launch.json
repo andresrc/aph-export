@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aph-export}",
+            "name": "Debug aph-export",
+            "target": "aph-export",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug aph-export"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aph-export}",
+            "name": "Release aph-export",
+            "target": "aph-export",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release aph-export"
+        }
+    ]
+}
