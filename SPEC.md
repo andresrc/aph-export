@@ -77,10 +77,17 @@ The tool will interface with the **System Photo Library**. Support for other lib
 PhotoKit relies on asynchronous callbacks that require an active run loop. The tool must keep the main run loop alive (or use Swift structured concurrency via `async/await`) until all export operations have completed before exiting.
 
 ### Logging & Progress
-The tool will provide verbose output to `stdout`:
-- Every asset being processed will be logged with its source date and target path.
-- Errors for individual assets will be logged but should not necessarily stop the entire process (best effort).
-- A final summary of successful exports and errors will be shown at the end.
+The tool will write verbose logs to a file stored in the output folder, named using the pattern `YYYYMMDD-HHMMSS-export.log` corresponding to the UTC date and time when the process was launched. In this log, the tool will write:
+- Every asset being processed, along with its source date and target path.
+- Individual asset errors (which should not stop the export process).
+- A final summary of successful exports, skipped assets, and errors.
+
+Additionally, the tool will print progress updates and the final summary to standard output (`stdout`), and write errors to standard error (`stderr`).
+
+To support concurrency and robustness, the logging mechanism must adhere to the following:
+- **Thread Safety:** Because assets are exported concurrently, logging to the file must be thread-safe (e.g., using a Swift actor or serial dispatch queue) to prevent log line interleaving or race conditions.
+- **Dry-Run Behavior:** In dry-run mode (`--dry-run`), no log file or output folder will be created on disk. All verbose log output that would normally go to the file will be printed to standard output instead.
+- **Writability Check:** If the output directory is not writable, the tool must exit early with code `2` (Fatal error) before trying to initialize or write to the log file.
 
 ### Permissions
 Since this is a macOS CLI tool using PhotoKit, it will require the user to grant "Photos" access. The tool should handle the authorization request gracefully or inform the user if access is denied.
