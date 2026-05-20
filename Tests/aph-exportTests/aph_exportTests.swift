@@ -159,3 +159,65 @@ struct ValidationTests {
         }
     }
 }
+
+// MARK: - ExportLogger Tests
+
+@Suite("ExportLogger Tests")
+struct ExportLoggerTests {
+    @Test func testDryRunDoesNotCreateFile() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let outputURL = tempDir.appendingPathComponent("dry_run_test_\(UUID().uuidString)")
+        
+        let logger = try ExportLogger(outputURL: outputURL, isDryRun: true)
+        await logger.close()
+        
+        // Ensure no directory or file was created
+        #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+    }
+    
+    @Test func testSuccessfulInitializationCreatesLogFile() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let outputURL = tempDir.appendingPathComponent("logger_test_\(UUID().uuidString)")
+        
+        // Initialize logger (this should create the directory and the log file)
+        let logger = try ExportLogger(outputURL: outputURL, isDryRun: false)
+        await logger.close()
+        
+        defer {
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+        
+        // Directory must exist
+        var isDir: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: outputURL.path, isDirectory: &isDir))
+        #expect(isDir.boolValue)
+        
+        // Log file must exist inside directory
+        let files = try FileManager.default.contentsOfDirectory(atPath: outputURL.path)
+        #expect(files.count == 1)
+        #expect(files[0].hasSuffix("-export.log"))
+    }
+    
+    @Test func testUnwritableDirectoryThrows() {
+        // A system directory like /usr/bin or /private/var/root is not writable by normal users
+        let unwritableURL = URL(fileURLWithPath: "/usr/bin/invalid_subdir_name")
+        
+        #expect(throws: Error.self) {
+            _ = try ExportLogger(outputURL: unwritableURL, isDryRun: false)
+        }
+    }
+    
+    @Test func testProgressBarTracking() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let outputURL = tempDir.appendingPathComponent("progress_test_\(UUID().uuidString)")
+        
+        let logger = try ExportLogger(outputURL: outputURL, isDryRun: true)
+        
+        // We can set total count and update counts without errors
+        await logger.setTotalCount(10)
+        await logger.updateCounts(successes: 3, skipped: 2, errors: 1)
+        
+        await logger.close()
+        #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+    }
+}

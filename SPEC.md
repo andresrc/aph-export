@@ -82,7 +82,7 @@ The tool will write verbose logs to a file stored in the output folder, named us
 - Individual asset errors (which should not stop the export process).
 - A final summary of successful exports, skipped assets, and errors.
 
-Additionally, the tool will print progress updates and the final summary to standard output (`stdout`), and write errors to standard error (`stderr`).
+Additionally, the tool will print progress updates and the final summary to standard output (`stdout`), and write errors to standard error (`stderr`). The progress should not be as verbose as the log, just some progress bar o similar that updates in place would be great.
 
 To support concurrency and robustness, the logging mechanism must adhere to the following:
 - **Thread Safety:** Because assets are exported concurrently, logging to the file must be thread-safe (e.g., using a Swift actor or serial dispatch queue) to prevent log line interleaving or race conditions.

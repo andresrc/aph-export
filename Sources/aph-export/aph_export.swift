@@ -88,20 +88,31 @@ struct AphExport: AsyncParsableCommand {
         let startDate = try DateUtils.parseDate(dateSpec1, isEnd: false, calendar: startCalendar)
         let endDate = try DateUtils.parseDate(dateSpec2 ?? dateSpec1, isEnd: true, calendar: startCalendar)
 
-        print("Exporting assets from \(startDate) to \(endDate)...")
-
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         guard status == .authorized || status == .limited else {
             printErr("Error: Photo library access denied.")
             throw ExitCode(2)
         }
 
+        let outputURL = URL(fileURLWithPath: output ?? FileManager.default.currentDirectoryPath)
+
+        let logger: ExportLogger
+        do {
+            logger = try ExportLogger(outputURL: outputURL, isDryRun: dryRun)
+        } catch {
+            printErr("Error: \(error.localizedDescription)")
+            throw ExitCode(2)
+        }
+
+        await logger.logMsg("Exporting assets from \(startDate) to \(endDate)...")
+
         if status == .limited {
-            print("Warning: Limited access granted. Only authorized assets will be exported.")
+            await logger.logWarning("Warning: Limited access granted. Only authorized assets will be exported.")
         }
 
         let exporter = Exporter(
-            output: output,
+            logger: logger,
+            outputURL: outputURL,
             dryRun: dryRun,
             conflictResolution: overwrite ? .overwrite : .skip,
             maxConcurrency: maxConcurrency,
@@ -109,7 +120,13 @@ struct AphExport: AsyncParsableCommand {
             localOnly: localOnly
         )
 
-        try await exporter.run(startDate: startDate, endDate: endDate)
+        do {
+            try await exporter.run(startDate: startDate, endDate: endDate)
+            await logger.close()
+        } catch {
+            await logger.close()
+            throw error
+        }
     }
 }
 
@@ -181,6 +198,251 @@ enum DateUtils {
     }
 }
 
+actor ExportLogger {
+    private let isDryRun: Bool
+    private let logFileURL: URL?
+    private var fileHandle: FileHandle?
+    private let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withYear, .withMonth, .withDay, .withTime, .withTimeZone]
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        return f
+    }()
+    
+    // Progress tracking
+    private var totalCount = 0
+    private var successes = 0
+    private var skipped = 0
+    private var errors = 0
+    private var completedAssets = 0
+    private var hasActiveProgress = false
+    
+    init(outputURL: URL, isDryRun: Bool) throws {
+        self.isDryRun = isDryRun
+        
+        if isDryRun {
+            self.logFileURL = nil
+            self.fileHandle = nil
+            return
+        }
+        
+        // 1. Ensure output directory exists or create it
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: outputURL.path, isDirectory: &isDir)
+        if !exists {
+            do {
+                try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+            } catch {
+                throw NSError(domain: "AphExport", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to create output directory '\(outputURL.path)': \(error.localizedDescription)"])
+            }
+        } else if !isDir.boolValue {
+            throw NSError(domain: "AphExport", code: 2, userInfo: [NSLocalizedDescriptionKey: "Output path '\(outputURL.path)' exists but is not a directory."])
+        }
+        
+        // 2. Perform write validation check
+        let testFileURL = outputURL.appendingPathComponent(".write_test_\(UUID().uuidString)")
+        do {
+            try "test".write(to: testFileURL, atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(at: testFileURL)
+        } catch {
+            throw NSError(domain: "AphExport", code: 2, userInfo: [NSLocalizedDescriptionKey: "Output directory '\(outputURL.path)' is not writable: \(error.localizedDescription)"])
+        }
+        
+        // 3. Create log file: YYYYMMDD-HHMMSS-export.log in UTC
+        let formatter = DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let dateString = formatter.string(from: Date())
+        let filename = "\(dateString)-export.log"
+        let fileURL = outputURL.appendingPathComponent(filename)
+        
+        self.logFileURL = fileURL
+        
+        if !FileManager.default.createFile(atPath: fileURL.path, contents: nil) {
+            throw NSError(domain: "AphExport", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to create log file at '\(fileURL.path)'"])
+        }
+        
+        guard let handle = try? FileHandle(forWritingTo: fileURL) else {
+            throw NSError(domain: "AphExport", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to open log file for writing at '\(fileURL.path)'"])
+        }
+        self.fileHandle = handle
+    }
+    
+    func close() {
+        clearProgressLine()
+        hasActiveProgress = false
+        try? fileHandle?.synchronize()
+        try? fileHandle?.close()
+        fileHandle = nil
+    }
+    
+    private func writeToFile(_ line: String) {
+        guard let handle = fileHandle else { return }
+        if let data = line.data(using: .utf8) {
+            try? handle.write(contentsOf: data)
+        }
+    }
+    
+    func setTotalCount(_ count: Int) {
+        self.totalCount = count
+        self.successes = 0
+        self.skipped = 0
+        self.errors = 0
+        self.completedAssets = 0
+        self.hasActiveProgress = count > 0
+        if hasActiveProgress {
+            printProgress()
+        }
+    }
+    
+    func updateCounts(successes: Int, skipped: Int, errors: Int) {
+        self.successes += successes
+        self.skipped += skipped
+        self.errors += errors
+        self.completedAssets += 1
+        printProgress()
+    }
+    
+    private func clearProgressLine() {
+        if hasActiveProgress {
+            print("\r\u{1B}[K", terminator: "")
+            fflush(stdout)
+        }
+    }
+    
+    private func printProgress() {
+        guard hasActiveProgress, totalCount > 0 else { return }
+        let completed = min(completedAssets, totalCount)
+        let percentage = Int((Double(completed) / Double(totalCount) * 100.0).rounded())
+        
+        let barWidth = 20
+        let completedBlocks = Int((Double(completed) / Double(totalCount) * Double(barWidth)).rounded())
+        let safeCompletedBlocks = min(barWidth, max(0, completedBlocks))
+        let bar = String(repeating: "█", count: safeCompletedBlocks) + String(repeating: "░", count: barWidth - safeCompletedBlocks)
+        
+        print("\rExporting: \(bar) \(percentage)% | \(completed)/\(totalCount) | Success: \(successes), Skip: \(skipped), Error: \(errors)", terminator: "")
+        fflush(stdout)
+    }
+    
+    func logMsg(_ message: String) {
+        let timestamp = isoFormatter.string(from: Date())
+        let logLine = "[\(timestamp)] \(message)\n"
+        
+        if !isDryRun {
+            writeToFile(logLine)
+        }
+        clearProgressLine()
+        print(message)
+        fflush(stdout)
+        printProgress()
+    }
+    
+    func logWarning(_ message: String) {
+        let timestamp = isoFormatter.string(from: Date())
+        let logLine = "[\(timestamp)] WARNING: \(message)\n"
+        
+        if !isDryRun {
+            writeToFile(logLine)
+        }
+        clearProgressLine()
+        print(message)
+        fflush(stdout)
+        printProgress()
+    }
+    
+    func logAssetProcessing(filename: String, sourceDate: Date, targetPath: String) {
+        let timestamp = isoFormatter.string(from: Date())
+        let sourceDateStr = isoFormatter.string(from: sourceDate)
+        
+        let fileLogLine = "[\(timestamp)] Processing \(filename) (Source Date: \(sourceDateStr)) -> Target: \(targetPath)\n"
+        
+        if isDryRun {
+            clearProgressLine()
+            print("[DRY RUN] Would export \(filename) to \(targetPath)")
+            fflush(stdout)
+            printProgress()
+        } else {
+            writeToFile(fileLogLine)
+        }
+    }
+    
+    func logAssetSkipped(filename: String, reason: String) {
+        let timestamp = isoFormatter.string(from: Date())
+        
+        let fileLogLine = "[\(timestamp)] SKIPPED \(filename): \(reason)\n"
+        
+        if isDryRun {
+            clearProgressLine()
+            print("[DRY RUN] Would skip \(filename): \(reason)")
+            fflush(stdout)
+            printProgress()
+        } else {
+            writeToFile(fileLogLine)
+        }
+    }
+    
+    func logAssetError(filename: String, errorDescription: String) {
+        let timestamp = isoFormatter.string(from: Date())
+        
+        let fileLogLine = "[\(timestamp)] ERROR exporting \(filename): \(errorDescription)\n"
+        let consoleLogLine = "Error exporting \(filename): \(errorDescription)"
+        
+        if isDryRun {
+            clearProgressLine()
+            let errLine = "Error exporting \(filename): \(errorDescription)\n"
+            FileHandle.standardError.write(Data(errLine.utf8))
+            printProgress()
+        } else {
+            writeToFile(fileLogLine)
+            clearProgressLine()
+            let errLine = consoleLogLine + "\n"
+            FileHandle.standardError.write(Data(errLine.utf8))
+            printProgress()
+        }
+    }
+    
+    func logTranscoding(filename: String) {
+        let timestamp = isoFormatter.string(from: Date())
+        
+        let fileLogLine = "[\(timestamp)] Transcoding \(filename) to JPEG...\n"
+        
+        if isDryRun {
+            clearProgressLine()
+            print("[DRY RUN] Would transcode \(filename) to JPEG")
+            fflush(stdout)
+            printProgress()
+        } else {
+            writeToFile(fileLogLine)
+        }
+    }
+    
+    func logSummary(successes: Int, skipped: Int, errors: Int) {
+        let timestamp = isoFormatter.string(from: Date())
+        
+        clearProgressLine()
+        hasActiveProgress = false
+        
+        let summaryText = """
+        
+        Summary:
+        Successfully exported: \(successes)
+        Skipped: \(skipped)
+        Errors: \(errors)
+        """
+        
+        let fileLogLine = "[\(timestamp)] Summary:\nSuccessfully exported: \(successes)\nSkipped: \(skipped)\nErrors: \(errors)\n"
+        
+        if isDryRun {
+            print(summaryText)
+            fflush(stdout)
+        } else {
+            writeToFile(fileLogLine)
+            print(summaryText)
+            fflush(stdout)
+        }
+    }
+}
+
 final class Exporter: Sendable {
     enum ConflictResolution: Sendable {
         case skip
@@ -193,7 +455,8 @@ final class Exporter: Sendable {
         var errors: Int = 0
     }
 
-    let output: String?
+    let logger: ExportLogger
+    let outputURL: URL
     let dryRun: Bool
     let conflictResolution: ConflictResolution
     let maxConcurrency: Int
@@ -207,14 +470,16 @@ final class Exporter: Sendable {
     }()
 
     init(
-        output: String?,
+        logger: ExportLogger,
+        outputURL: URL,
         dryRun: Bool,
         conflictResolution: ConflictResolution,
         maxConcurrency: Int,
         burstAll: Bool,
         localOnly: Bool
     ) {
-        self.output = output
+        self.logger = logger
+        self.outputURL = outputURL
         self.dryRun = dryRun
         self.conflictResolution = conflictResolution
         self.maxConcurrency = maxConcurrency
@@ -232,9 +497,7 @@ final class Exporter: Sendable {
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
 
         let assets = PHAsset.fetchAssets(with: fetchOptions)
-        print("Found \(assets.count) assets to process.")
-
-        let outputURL = URL(fileURLWithPath: output ?? FileManager.default.currentDirectoryPath)
+        await logger.logMsg("Found \(assets.count) assets to process.")
 
         // Expand bursts, filtering expanded frames to the requested date range.
         var allAssets: [PHAsset] = []
@@ -255,7 +518,8 @@ final class Exporter: Sendable {
             }
         }
 
-        print("Total items to process (including bursts): \(allAssets.count)")
+        await logger.logMsg("Total items to process (including bursts): \(allAssets.count)")
+        await logger.setTotalCount(allAssets.count)
 
         var totalSuccesses = 0
         var totalSkipped = 0
@@ -269,7 +533,7 @@ final class Exporter: Sendable {
                 while activeCount < maxConcurrency && assetIndex < allAssets.count {
                     let asset = allAssets[assetIndex]
                     group.addTask {
-                        await self.process(asset: asset, outputURL: outputURL)
+                        await self.process(asset: asset)
                     }
                     assetIndex += 1
                     activeCount += 1
@@ -280,23 +544,21 @@ final class Exporter: Sendable {
                     totalSuccesses += outcome.successes
                     totalSkipped += outcome.skipped
                     totalErrors += outcome.errors
+                    await logger.updateCounts(successes: outcome.successes, skipped: outcome.skipped, errors: outcome.errors)
                 }
             }
         }
 
-        print("\nSummary:")
-        print("Successfully exported: \(totalSuccesses)")
-        print("Skipped: \(totalSkipped)")
-        print("Errors: \(totalErrors)")
+        await logger.logSummary(successes: totalSuccesses, skipped: totalSkipped, errors: totalErrors)
 
         if totalErrors > 0 {
             throw ExitCode(1)
         }
     }
 
-    private func process(asset: PHAsset, outputURL: URL) async -> ExportOutcome {
+    private func process(asset: PHAsset) async -> ExportOutcome {
         guard let creationDate = asset.creationDate else {
-            printErr("Error: Asset \(asset.localIdentifier) has no creation date.")
+            await logger.logAssetError(filename: asset.localIdentifier, errorDescription: "Asset has no creation date.")
             return ExportOutcome(successes: 0, skipped: 0, errors: 1)
         }
 
@@ -316,7 +578,7 @@ final class Exporter: Sendable {
             do {
                 try FileManager.default.createDirectory(at: targetFolderURL, withIntermediateDirectories: true)
             } catch {
-                printErr("Error creating directory \(targetFolderURL.path): \(error.localizedDescription)")
+                await logger.logAssetError(filename: "Directory Creation", errorDescription: "Failed to create directory \(targetFolderURL.path): \(error.localizedDescription)")
                 return ExportOutcome(successes: 0, skipped: 0, errors: 1)
             }
         }
@@ -338,7 +600,7 @@ final class Exporter: Sendable {
             if FileManager.default.fileExists(atPath: targetURL.path) {
                 switch conflictResolution {
                 case .skip:
-                    print("Skipping \(targetURL.path): file already exists.")
+                    await logger.logAssetSkipped(filename: originalFilename, reason: "file already exists at \(targetURL.path)")
                     outcome.skipped += 1
                     continue resourceLoop
                 case .overwrite:
@@ -347,12 +609,12 @@ final class Exporter: Sendable {
             }
 
             if dryRun {
-                print("[DRY RUN] Would export \(originalFilename) to \(targetURL.path)")
+                await logger.logAssetProcessing(filename: originalFilename, sourceDate: creationDate, targetPath: targetURL.path)
                 outcome.successes += 1
                 continue
             }
 
-            print("Exporting \(originalFilename) to \(targetURL.path)...")
+            await logger.logAssetProcessing(filename: originalFilename, sourceDate: creationDate, targetPath: targetURL.path)
 
             let options = PHAssetResourceRequestOptions()
             options.isNetworkAccessAllowed = !localOnly
@@ -366,17 +628,17 @@ final class Exporter: Sendable {
                     let jpegFilename = "\(targetFilename.dropLast(extensionName.count))jpg"
                     let jpegURL = targetFolderURL.appendingPathComponent(jpegFilename)
                     if !FileManager.default.fileExists(atPath: jpegURL.path) || conflictResolution == .overwrite {
-                        print("Transcoding \(originalFilename) to JPEG...")
+                        await logger.logTranscoding(filename: originalFilename)
                         try await transcodeToJPEG(at: targetURL, to: jpegURL)
                     }
                 }
 
                 outcome.successes += 1
             } catch let error as NSError where localOnly && error.domain == "com.apple.photos.error" && error.code == 3164 {
-                print("Skipping \(originalFilename): original not stored locally.")
+                await logger.logAssetSkipped(filename: originalFilename, reason: "original not stored locally.")
                 outcome.skipped += 1
             } catch {
-                printErr("Error exporting \(originalFilename): \(error.localizedDescription)")
+                await logger.logAssetError(filename: originalFilename, errorDescription: error.localizedDescription)
                 outcome.errors += 1
             }
         }
