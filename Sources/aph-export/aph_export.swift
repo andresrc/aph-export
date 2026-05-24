@@ -3,6 +3,7 @@ import AppKit
 import Foundation
 import Photos
 import UniformTypeIdentifiers
+import ImageIO
 
 private func printErr(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
@@ -665,22 +666,38 @@ final class Exporter: Sendable {
     private func transcodeToJPEG(at sourceURL: URL, to destinationURL: URL) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .utility).async {
-                guard let image = NSImage(contentsOf: sourceURL),
-                      let tiffData = image.tiffRepresentation,
-                      let bitmap = NSBitmapImageRep(data: tiffData),
-                      let jpegData = bitmap.representation(using: .jpeg, properties: [:]) else {
+                guard let imageSource = CGImageSourceCreateWithURL(sourceURL as CFURL, nil) else {
                     continuation.resume(throwing: NSError(
                         domain: "AphExport",
                         code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "Failed to transcode image to JPEG."]
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to create image source for transcoding."]
                     ))
                     return
                 }
-                do {
-                    try jpegData.write(to: destinationURL)
+                
+                guard let destination = CGImageDestinationCreateWithURL(destinationURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+                    continuation.resume(throwing: NSError(
+                        domain: "AphExport",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to create image destination for transcoding."]
+                    ))
+                    return
+                }
+                
+                let options = [
+                    kCGImageDestinationLossyCompressionQuality as String: 0.9
+                ] as CFDictionary
+                
+                CGImageDestinationAddImageFromSource(destination, imageSource, 0, options)
+                
+                if CGImageDestinationFinalize(destination) {
                     continuation.resume()
-                } catch {
-                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(throwing: NSError(
+                        domain: "AphExport",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to finalize JPEG transcode."]
+                    ))
                 }
             }
         }
